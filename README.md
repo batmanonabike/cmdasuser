@@ -30,6 +30,28 @@ This repository is an educational and technical demonstration of Windows interna
 security and systems programming. It is not production-hardened security software and must not be
 exposed to untrusted users or networks.
 
+## How It Works
+
+The project installs a Windows service configured to run under an account with the required
+high-level operating-system privilege.
+
+Once the service is running:
+
+1. A client connects to the service using the project's IPC mechanism.
+2. The client sends a command request to the service.
+3. The service executes the command within its own privileged process context.
+4. Standard output and standard error are redirected back through the IPC channel.
+5. The client presents the response as an interactive command prompt.
+
+This separates the interactive client from the privileged execution process. The client does not
+need to hold the high-level privilege itself; the Windows service owns that privilege and performs
+the command execution on the client's behalf.
+
+The project explores more than one communication path, including local process communication and
+the TCP-based client/server demonstration. The TCP path provides the reverse-shell-style interactive
+experience, while the service path demonstrates how Windows service accounts, privileges and
+inter-process communication can be combined.
+
 ## Security Warning
 
 This project creates a deliberately powerful Windows execution mechanism.
