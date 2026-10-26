@@ -1,0 +1,14 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Win32" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="CmdAsUser/CmdAsUser.vcxproj" Id="c176216f-7060-49b2-8c57-31c3caf319b3" />
+  <Project Path="CommandClient/CommandClient.vcxproj" Id="1c23605f-7738-45dc-8a28-4237af215a13" />
+  <Project Path="CommandInjectee/CommandInjectee.vcxproj" Id="2194454e-0e84-4076-bb67-50faee2bc661" />
+  <Project Path="CommandInjector/CommandInjector.vcxproj" Id="c936743c-91be-4787-9410-88a41ad180e1" />
+  <Project Path="CommandLib/CommandLib.vcxproj" Id="a6ded602-69b5-4857-8075-726f8f9136e6" />
+  <Project Path="CommandServer/CommandServer.vcxproj" Id="a26a5876-222b-4198-a34e-cf9c35c83362" />
+  <Project Path="ConfigServiceUser/ConfigServiceUser.vcxproj" Id="cea26719-c8d3-4360-9949-95e161de3bd5" />
+  <Project Path="StopService/StopService.vcxproj" Id="8b18c106-00ad-46c1-a1f1-51a8299cd936" />
+</Solution>

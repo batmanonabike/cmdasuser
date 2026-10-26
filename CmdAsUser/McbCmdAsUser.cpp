@@ -76,9 +76,9 @@ class McbParams
 public:
     McbParams() {}
 
-#define McbMARSHALSTR(lpMem, str)                                            \
+#define McbMARSHALSTR(lpMem, str)                                           \
     {                                                                       \
-        DWORD cbString = str.size();                                        \
+        DWORD cbString = (DWORD)str.size();                                 \
         *((DWORD*)lpMem) = cbString;                                        \
         lpMem += sizeof(DWORD);                                             \
                                                                             \

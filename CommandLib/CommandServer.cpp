@@ -87,7 +87,7 @@ void CommandServer::process_command(const std::string & command)
 
     // Write the command to the cmd.exe process's STDIN
     DWORD written;
-    if (!WriteFile(stdInWrite_, commandLine.c_str(), commandLine.size(), &written, NULL)) {
+    if (!WriteFile(stdInWrite_, commandLine.c_str(), static_cast<DWORD>(commandLine.size()), &written, NULL)) {
         throw std::runtime_error("Failed to write to child process");
     }
 }
@@ -98,7 +98,7 @@ std::string CommandServer::read_stdout_response() {
     std::vector<char> output_buffer(1024 * 10);
 
     while (true) {
-        if (!ReadFile(stdOutRead_, output_buffer.data(), output_buffer.size(), &read, NULL) || read == 0) {
+        if (!ReadFile(stdOutRead_, output_buffer.data(), static_cast<DWORD>(output_buffer.size()), &read, NULL) || read == 0) {
             throw std::runtime_error("Failed to read stdout pipe");
         }
         

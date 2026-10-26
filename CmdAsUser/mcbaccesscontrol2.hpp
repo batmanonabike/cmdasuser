@@ -3977,7 +3977,7 @@ template <int n> bool McbSecurityDescriptorImpl<n>::McbSetDACL(const PACL pAcl)
     
     m_dacl = pAcl;
 
-	return ::SetSecurityDescriptorDacl(m_pSD, (BOOL)(PACL)m_dacl, 
+	return ::SetSecurityDescriptorDacl(m_pSD, (PACL)m_dacl != NULL, 
 		(PACL)m_dacl, FALSE) == TRUE;
 	
 }/* McbSecurityDescriptorImpl<n>::McbSetDACL */

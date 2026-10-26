@@ -1,0 +1,8 @@
+<Project>
+  <!-- One output folder per configuration for every project, whether built from
+       the solution or on its own: Release\, Debug\, x64\Release\, x64\Debug\ -->
+  <PropertyGroup>
+    <OutDir Condition="'$(Platform)' == 'Win32'">$(MSBuildThisFileDirectory)$(Configuration)\</OutDir>
+    <OutDir Condition="'$(Platform)' != 'Win32'">$(MSBuildThisFileDirectory)$(Platform)\$(Configuration)\</OutDir>
+  </PropertyGroup>
+</Project>

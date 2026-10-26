@@ -158,7 +158,7 @@
  * typedef for clean-up function
  ****************************************************************************
  */
-typedef void (__stdcall* PFNFREERESOURCE)(DWORD);
+typedef void (__stdcall* PFNFREERESOURCE)(DWORD_PTR);
 
 /**
  ****************************************************************************
@@ -172,7 +172,7 @@ typedef void (__stdcall* PFNFREERESOURCE)(DWORD);
  *    22nd June          2000     -     (V1.0) Creation (MCB)
  ****************************************************************************
  */
-template <class theType, PFNFREERESOURCE pfnFree, DWORD emptyType = NULL>
+template <class theType, PFNFREERESOURCE pfnFree, DWORD_PTR emptyType = 0>
 class McbSmartDestroy
 {    
 public:
@@ -227,14 +227,14 @@ protected:
     {
         if (McbIsValid())
         {
-            ((PFNFREERESOURCE)pfnFree)((DWORD)m_type);                        
+            ((PFNFREERESOURCE)pfnFree)((DWORD_PTR)m_type);                        
 
            /*
             *****************************************************************
             * MCB 02.10.2001 Added so that resources can be reused.
             *****************************************************************
             */
-			m_type = emptyType;
+			m_type = (theType)emptyType;
         }
     }
 
@@ -258,7 +258,7 @@ typedef McbSmartDestroy<HKEY,   (PFNFREERESOURCE)::RegCloseKey>
     McbSmartDestroyHKEY;
 
 typedef McbSmartDestroy<HANDLE, (PFNFREERESOURCE)::CloseHandle, 
-    (DWORD)INVALID_HANDLE_VALUE> McbSmartDestroyFILE;
+    (DWORD_PTR)-1 /* INVALID_HANDLE_VALUE */> McbSmartDestroyFILE;
 
 typedef McbSmartDestroy<LPCRITICAL_SECTION, 
     (PFNFREERESOURCE)::DeleteCriticalSection> McbSmartDestroyCS;
