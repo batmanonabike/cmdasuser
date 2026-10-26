@@ -83,13 +83,17 @@ logon - for example, to apply the `DisableCAD` fix above on each sign-in.
 ### What it does
 
 ```
-Logon (user context)  ->  logon-startup-launcher.cmd  ->  CommandClient
-                               ->  CommandServer service (SYSTEM)  ->  logon-task.cmd  ->  startup.ps1
+Logon (user context)
+   ->  logon-startup-launcher.cmd
+         ->  CmdAsUser System . /c CommandServer.exe   (IPC to McbCmdAsUser service, SYSTEM)
+               ->  service spawns CommandServer as SYSTEM (session 0)
+         ->  CommandClient  ->  CommandServer (SYSTEM)  ->  logon-task.cmd  ->  startup.ps1
 ```
 
-- The SYSTEM privilege comes from the **CommandServer service**, which already runs as SYSTEM. The
-  Startup-folder launcher runs unelevated in the user context and simply drives `CommandClient`, which
-  connects to the service; the service executes the work as SYSTEM.
+- The SYSTEM privilege comes from the **`McbCmdAsUser` service** - an auto-start LocalSystem service
+  installed by `CmdAsUser /install`. The Startup-folder launcher runs unelevated and hands its request
+  to that running service over IPC (**no admin needed**); the service spawns `CommandServer` as SYSTEM
+  in session 0, and `CommandClient` then drives it.
 - `logon-task.cmd` recreates a log each run, records the account it is running as, and - if a
   PowerShell script is present - executes it and captures its output.
 - `startup.ps1` is the default payload. As shipped it disables the Ctrl+Alt+Del logon requirement
@@ -108,16 +112,17 @@ live in [`scripts/`](scripts); the details are in [docs/logon-task-setup.md](doc
    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-logon-task.ps1
    ```
 
-   It invokes `CmdAsUser.exe` (which copies itself, `CommandClient.exe` and `CommandServer.exe` into
-   System32/SysWOW64), copies `startup.ps1` and `logon-task.cmd` into the install location
+   It runs `CmdAsUser /install` (which deploys `CmdAsUser.exe`, `CommandClient.exe` and
+   `CommandServer.exe` into System32/SysWOW64 and installs + starts the auto-start LocalSystem
+   `McbCmdAsUser` service), copies `startup.ps1` and `logon-task.cmd` into the install location
    (`%ProgramData%\CmdAsUser` by default), and sets the `CMDASUSER_*` machine variables with `setx /M`.
    Any step that fails is reported and the script exits with a non-zero code.
 3. Add the Startup-folder shortcut so it runs at logon (see
    [docs/logon-task-setup.md](docs/logon-task-setup.md) section 4), then log off and back on and check
    the log.
 
-> The SYSTEM context depends on the CommandServer service being installed and running as SYSTEM
-> (Automatic start). The installer configures the logon task, not the service itself.
+> The SYSTEM context depends on the `McbCmdAsUser` service, which `CmdAsUser /install` installs and
+> starts (auto-start, LocalSystem). Remove it with `CmdAsUser /uninstall` from an elevated prompt.
 
 ## Security Warning
 

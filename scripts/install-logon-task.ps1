@@ -59,31 +59,35 @@ $system32    = Join-Path $env:windir 'System32'
 $cmdAsUser   = Join-Path $BinDir 'CmdAsUser.exe'
 $logPath     = Join-Path $InstallHome 'logon-task.log'
 $psPath      = Join-Path $InstallHome 'startup.ps1'
-$taskPath    = Join-Path $InstallHome 'logon-task.cmd'
 
 Write-Host "CmdAsUser logon task installer"
 Write-Host "  BinDir      : $BinDir"
 Write-Host "  InstallHome : $InstallHome"
 Write-Host ''
 
-# --- Step 1: CmdAsUser self-copies into System32 / SysWOW64 -------------------
-# CmdAsUser copies from its CURRENT DIRECTORY, so run it with CWD = BinDir.
-# The tool owns the copy; we just invoke it.
-Write-Host 'Step 1: deploying binaries via CmdAsUser self-copy...'
+# --- Step 1: deploy binaries + install the persistent SYSTEM service ----------
+# "CmdAsUser /install" (run elevated) stops any running instance, deploys
+# CmdAsUser/CommandClient/CommandServer into System32 and SysWOW64 (so they are
+# on the PATH), then registers the auto-start LocalSystem "McbCmdAsUser" service
+# and starts it. Once running, the non-elevated logon launcher can drive it over
+# IPC without admin. CmdAsUser copies from its CURRENT DIRECTORY, so CWD = BinDir.
+Write-Host 'Step 1: deploying binaries and installing the SYSTEM service...'
 if (-not (Test-Path $cmdAsUser)) {
     Fail "CmdAsUser.exe not found at: $cmdAsUser (build the x64 Release first)."
 } else {
     Push-Location $BinDir
     try {
-        # The tool owns the copy and may write to stderr (e.g. error 32 / sharing
-        # violation when a binary is already in use by the running service - benign,
-        # it just means it is already deployed). Do not let that abort the install.
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        $out = & $cmdAsUser 2>&1 | ForEach-Object { "$_" }
+        $out  = & $cmdAsUser /install 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP
         if ($out) { $out | ForEach-Object { Write-Host "    $_" } }
-        Write-Host '  [ok]   CmdAsUser invoked (self-copy to System32/SysWOW64)'
+        if ($code -ne 0) {
+            Fail "CmdAsUser /install failed (exit $code)."
+        } else {
+            Write-Host '  [ok]   binaries deployed; McbCmdAsUser service installed and started'
+        }
     } finally {
         Pop-Location
     }

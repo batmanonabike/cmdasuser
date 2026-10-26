@@ -26,6 +26,15 @@ void handle_client(tcp::socket && socket) {
 }
 
 int main() {
+    // Run as a background daemon: hide our console window. Nothing depends on
+    // it - the only thing it shows is diagnostic std::cout; the real work goes
+    // over the socket and the child cmd.exe's redirected pipes. We are launched
+    // via "CmdAsUser System . /c CommandServer.exe" (CREATE_NEW_CONSOLE), so a
+    // console exists; hiding it here keeps no window on screen at logon.
+    if (HWND hwndConsole = ::GetConsoleWindow()) {
+        ::ShowWindow(hwndConsole, SW_HIDE);
+    }
+
     try {
         asio::io_context io_context;
         tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), 54000));

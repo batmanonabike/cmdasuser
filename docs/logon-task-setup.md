@@ -102,26 +102,55 @@ CmdAsUser System . /c cmd.exe /c "%CMDASUSER_HOME%\logon-task.cmd"
 
 ## 4. Run on logon via the Startup folder
 
-### Why not call CmdAsUser directly from Startup
+### How the SYSTEM privilege is obtained
 
-`CmdAsUser`'s `System` path reuses **its own process token**
-([`OpenProcessToken(GetCurrentProcess())`](../CmdAsUser/McbCmdAsUser.cpp)) - it does not fetch a SYSTEM
-token from elsewhere. So `CmdAsUser System . /c ...` only produces a SYSTEM process when `CmdAsUser.exe`
-is **already** running as SYSTEM. The Startup folder runs in your **normal, unelevated user context**,
-so calling `CmdAsUser` there would run as you (and `CreateProcessAsUser` would likely fail with
-`ERROR_PRIVILEGE_NOT_HELD`) - not as SYSTEM.
+`CmdAsUser` can reach SYSTEM two ways:
 
-### The route that works
+- **Transient service (needs admin).** With no persistent service present, `CmdAsUser System . /c ...`
+  opens the SCM for **write**, registers a throwaway service from a temp copy of itself, starts it as
+  LocalSystem, hands it the request over shared memory, then stops and deletes it. Opening the SCM for
+  write **requires administrator rights**, so from the non-elevated Startup folder this path fails with
+  `Open SCM failed. Access is denied` (error 5).
+- **Persistent service over IPC (no admin).** `CmdAsUser /install` (run once, elevated) registers a
+  permanent **auto-start LocalSystem** service named `McbCmdAsUser`. Because it is always running as
+  SYSTEM, a later `CmdAsUser System . /c ...` simply hands the request to it over the shared-memory IPC,
+  whose kernel objects have a null DACL - so **a non-elevated caller can reach them**. No SCM access, no
+  admin. This is what lets the logon launcher drive it.
 
-The privilege lives in the **CommandServer service** (running as SYSTEM). The Startup entry simply
-drives `CommandClient`, which connects to that service over `127.0.0.1:54000`; the server executes the
-command as SYSTEM:
+So the **install is elevated** (it may touch the SCM); the **logon launcher is not** (it only does IPC
+to the already-running service).
+
+### The chain
 
 ```
-Startup folder (user)  ->  CommandClient  ->  CommandServer service (SYSTEM)  ->  logon-task.cmd
+Startup (user)
+  -> CmdAsUser System . /c CommandServer.exe     (IPC to McbCmdAsUser service, SYSTEM)
+        -> service spawns CommandServer as SYSTEM (session 0, no window)
+  -> CommandClient  ->  CommandServer (SYSTEM)  ->  logon-task.cmd
 ```
 
 `CommandClient` reads commands from stdin, so the launcher pipes them in.
+
+### Starting the server
+
+Before piping to `CommandClient`, the launcher ensures `CommandServer` is up:
+
+```
+tasklist /fi "imagename eq CommandServer.exe" | find /i "CommandServer.exe" >nul
+if errorlevel 1 (
+    "%CMDASUSER_BIN%\CmdAsUser.exe" System . /c CommandServer.exe
+    >nul ping -n 3 127.0.0.1
+)
+```
+
+`CommandServer.exe` lives in `System32` (on the PATH, deployed by `/install`). The `McbCmdAsUser`
+service spawns it as SYSTEM in **session 0**, so there is **no visible window**. The short `ping` pause
+gives the server time to bind `127.0.0.1:54000` before the client connects; without it `CommandClient`
+can report `connect: No connection could be made because the target machine actively refused it`. The
+`tasklist` guard avoids launching a second instance that would just fail to bind the port and exit.
+
+> Because `CommandServer` runs in session 0 it survives logoff, and the `McbCmdAsUser` service is
+> auto-start, so after a reboot it is back as SYSTEM before you log on - ready for the launcher.
 
 ### Prerequisites
 
@@ -130,7 +159,10 @@ Startup folder (user)  ->  CommandClient  ->  CommandServer service (SYSTEM)  ->
   `C:\Windows\System32` silently become `C:\Windows\SysWOW64`, and `powershell.exe` would resolve to the
   32-bit PowerShell. With x64 there is no redirection and these resolve correctly. (If you ever must run
   a 32-bit build, reach the real System32 via `%windir%\Sysnative`.)
-- `CommandServer` service installed and running as SYSTEM, **Automatic** start (so it is up at logon).
+- `CmdAsUser /install` has been run once, **elevated** (the installer does this in Step 1). It stops any
+  running instance, deploys `CmdAsUser.exe`, `CommandClient.exe`, `CommandServer.exe` into
+  `System32`/`SysWOW64` (putting them on the PATH), and installs + starts the `McbCmdAsUser` SYSTEM
+  service. To remove it later: `CmdAsUser /uninstall` (elevated).
 - Machine-level env vars set (section 1). Add one more for the binaries:
   ```
   setx /M CMDASUSER_BIN "%USERPROFILE%\source\repos\cmdasuser_02\x64\Release"
@@ -151,9 +183,9 @@ Startup folder (user)  ->  CommandClient  ->  CommandServer service (SYSTEM)  ->
 
 ### Notes
 
-- Because this goes through the service, the SYSTEM context comes from the service account, not from the
-  logon session - exactly the separation the project is built around.
-- If you would rather use the `CmdAsUser System . /c ...` form at logon, that requires a launcher that
-  is itself SYSTEM - i.e. **Task Scheduler** with a trigger "At log on" and "Run whether user is logged
-  on or not" under the SYSTEM account. That is an alternative to the Startup folder, not a companion to
-  it.
+- The SYSTEM context comes from the `McbCmdAsUser` service account, not from the logon session - exactly
+  the separation the project is built around.
+- The logon launcher needs **no** elevation or Task Scheduler: it reaches the already-running SYSTEM
+  service over IPC. Only the one-time `CmdAsUser /install` needs admin.
+- `CommandServer` runs in session 0 (no desktop), so it never shows a window regardless of the
+  `ShowWindow(SW_HIDE)` guard in `CommandServer.cpp`.

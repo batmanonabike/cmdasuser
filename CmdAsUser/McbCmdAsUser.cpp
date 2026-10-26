@@ -14,6 +14,7 @@
 #include "McbFormatError.hpp"
 #include "McbSmartCleanup.hpp"
 #include "NullSecurityAttributes.h"
+#include <tlhelp32.h>
 
 class EveryoneSA : public SECURITY_ATTRIBUTES
 {
@@ -895,6 +896,16 @@ public:
         */
         if (dwWait == WAIT_OBJECT_0)
         {
+           /*
+            *****************************************************************
+            * g_evtData is a manual-reset event, so clear it now that we
+            * have claimed this request.  The persistent service is reused
+            * for many requests - without this reset McbRun() would re-fire
+            * on every poll and re-run the last command repeatedly.
+            *****************************************************************
+            */
+            ::ResetEvent(g_evtData);
+
             McbResults results;
             results.m_dwError = ERROR_BAD_COMMAND;
 
@@ -980,6 +991,373 @@ McbENDSERVICEMAP()
 
 /**
  ****************************************************************************
+ * <P> IPC fast-path: hand a request to an ALREADY RUNNING McbCmdAsUser
+ * service and wait for its result.  This is the handshake that used to be
+ * inline in McbInvokeService() once the service had been started.  The IPC
+ * objects (shared memory, events, mutex) are created by the service with a
+ * null DACL (EveryoneSA), so a NON-ELEVATED caller can reach them - this
+ * path needs no SCM access at all, which is what lets the logon launcher
+ * drive it without admin rights.  </P>
+ *
+ * @methodName  McbExecuteViaRunningService
+ *
+ * @param       &params
+ * @param       &results
+ *
+ * @return      void
+ *
+ * @author      Martyn C Brown
+ ****************************************************************************
+ */
+void McbExecuteViaRunningService(McbParams &params, McbResults &results)
+{
+    McbSmartSharedMem mem(McbMAXMEM, McbSHAREDMEM, &g_sa);
+
+   /*
+    *************************************************************************
+    * Marshal the parameters into the shared memory under the lock.
+    *************************************************************************
+    */
+    {
+        McbAutoMutex automutex(g_mutData);
+        params.McbMarshal((LPBYTE)mem);
+    }
+
+   /*
+    *************************************************************************
+    * The completion event is manual-reset and the service is long-lived,
+    * so clear any previous completion before signalling a fresh request.
+    *************************************************************************
+    */
+    McbSmartEvent evtComplete(McbCOMPLETEDEVENT, true, false, &g_sa);
+    ::ResetEvent(evtComplete);
+
+   /*
+    *************************************************************************
+    * Tell the service to process the request, then wait for it to finish.
+    *************************************************************************
+    */
+    ::SetEvent(g_evtData);
+    ::WaitForSingleObject(evtComplete, INFINITE);
+
+   /*
+    *************************************************************************
+    * Unmarshal the results the service wrote back.
+    *************************************************************************
+    */
+    {
+        McbAutoMutex automutex(g_mutData);
+        results.McbUnMarshal((LPBYTE)mem);
+    }
+}
+
+/**
+ ****************************************************************************
+ * <P> Return true if the persistent McbCmdAsUser service is installed AND
+ * currently running.  Opens the SCM with connect-only access and queries
+ * the service status - both permitted for a standard (non-elevated) user -
+ * so this is safe to call from the logon launcher.  </P>
+ *
+ * @methodName  McbIsServiceRunning
+ *
+ * @return      bool
+ *
+ * @author      Martyn C Brown
+ ****************************************************************************
+ */
+bool McbIsServiceRunning()
+{
+    bool bRunning = false;
+
+    SC_HANDLE hSCM = ::OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+    if (hSCM)
+    {
+        SC_HANDLE hService = ::OpenService(hSCM, McbSERVICENAME,
+            SERVICE_QUERY_STATUS);
+        if (hService)
+        {
+            SERVICE_STATUS ss = { 0 };
+            if (::QueryServiceStatus(hService, &ss) &&
+                ss.dwCurrentState == SERVICE_RUNNING)
+            {
+                bRunning = true;
+            }
+            ::CloseServiceHandle(hService);
+        }
+        ::CloseServiceHandle(hSCM);
+    }
+
+    return bRunning;
+}
+
+/**
+ ****************************************************************************
+ * <P> Stop the persistent service if it is installed and running, waiting
+ * for it to reach the stopped state.  Used before redeploying the binary,
+ * because a running service locks System32\CmdAsUser.exe.  Requires admin.
+ * </P>
+ *
+ * @methodName  McbStopServiceIfRunning
+ *
+ * @return      void
+ *
+ * @author      Martyn C Brown
+ ****************************************************************************
+ */
+void McbStopServiceIfRunning()
+{
+    SC_HANDLE hSCM = ::OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!hSCM)
+    {
+        return;
+    }
+
+    SC_HANDLE hService = ::OpenService(hSCM, McbSERVICENAME,
+        SERVICE_STOP | SERVICE_QUERY_STATUS);
+    if (hService)
+    {
+        SERVICE_STATUS ss = { 0 };
+        if (::QueryServiceStatus(hService, &ss) &&
+            ss.dwCurrentState != SERVICE_STOPPED)
+        {
+            if (::ControlService(hService, SERVICE_CONTROL_STOP, &ss))
+            {
+                while (::QueryServiceStatus(hService, &ss) &&
+                    ss.dwCurrentState != SERVICE_STOPPED)
+                {
+                    ::Sleep(300);
+                }
+            }
+        }
+        ::CloseServiceHandle(hService);
+    }
+    ::CloseServiceHandle(hSCM);
+}
+
+/**
+ ****************************************************************************
+ * <P> Terminate every running process whose image name matches (case
+ * insensitive).  Used at /install time to release System32 copies of
+ * CommandServer.exe / CommandClient.exe that a running instance would lock,
+ * so the fresh binaries can be deployed onto the PATH.  Requires admin to
+ * terminate the SYSTEM-owned CommandServer.  </P>
+ *
+ * @methodName  McbTerminateProcessByName
+ *
+ * @param       pszImageName
+ *
+ * @return      void
+ *
+ * @author      Martyn C Brown
+ ****************************************************************************
+ */
+void McbTerminateProcessByName(LPCTSTR pszImageName)
+{
+    HANDLE hSnap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    PROCESSENTRY32 pe = { sizeof(PROCESSENTRY32) };
+    if (::Process32First(hSnap, &pe))
+    {
+        do
+        {
+            if (::_tcsicmp(pe.szExeFile, pszImageName) == 0)
+            {
+                HANDLE hProc = ::OpenProcess(PROCESS_TERMINATE, FALSE,
+                    pe.th32ProcessID);
+                if (hProc)
+                {
+                    ::TerminateProcess(hProc, 0);
+                    ::CloseHandle(hProc);
+                }
+            }
+        } while (::Process32Next(hSnap, &pe));
+    }
+
+    ::CloseHandle(hSnap);
+}
+
+/**
+ ****************************************************************************
+ * <P> Install (or adopt) the persistent McbCmdAsUser service: an
+ * auto-start, LocalSystem service whose binary is the copy in System32.
+ * Once installed it is always running as SYSTEM, so later NON-ELEVATED
+ * invocations can reach it over the shared-memory IPC (see
+ * McbExecuteViaRunningService) instead of needing admin to spin up a
+ * transient service each time.  Requires admin (writes to the SCM).  </P>
+ *
+ * @methodName  McbInstallService
+ *
+ * @return      int    (a Win32 error code, ERROR_SUCCESS on success)
+ *
+ * @author      Martyn C Brown
+ ****************************************************************************
+ */
+int McbInstallService()
+{
+    SC_HANDLE hSCM = ::OpenSCManager(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+    if (!hSCM)
+    {
+        DWORD dwErr = ::GetLastError();
+        ::_tprintf(_T("OpenSCManager failed: %d (run elevated).\n"), dwErr);
+        return dwErr;
+    }
+
+   /*
+    *************************************************************************
+    * Point the service at the System32 copy of this exe.
+    *************************************************************************
+    */
+    TCHAR szSysDir[MAX_PATH];
+    ::GetSystemDirectory(szSysDir, MAX_PATH);
+
+    TCHAR szBinPath[MAX_PATH];
+    ::_stprintf_s(szBinPath, _T("%s\\CmdAsUser.exe"), szSysDir);
+
+    DWORD dwErr = ERROR_SUCCESS;
+
+    SC_HANDLE hService = ::OpenService(hSCM, McbSERVICENAME,
+        SERVICE_ALL_ACCESS);
+
+    if (!hService)
+    {
+        hService = ::CreateService(hSCM, McbSERVICENAME,
+            _T("CmdAsUser SYSTEM helper"),
+            SERVICE_ALL_ACCESS,
+            SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_AUTO_START,
+            SERVICE_ERROR_NORMAL,
+            szBinPath,
+            NULL, NULL, NULL,
+            NULL,               /* NULL account => LocalSystem */
+            NULL);
+
+        if (!hService)
+        {
+            dwErr = ::GetLastError();
+            ::_tprintf(_T("CreateService failed: %d\n"), dwErr);
+            ::CloseServiceHandle(hSCM);
+            return dwErr;
+        }
+
+        ::_tprintf(_T("Service '%s' created (auto-start, LocalSystem):\n")
+            _T("   %s\n"), McbSERVICENAME, szBinPath);
+    }
+    else
+    {
+        ::_tprintf(_T("Service '%s' already installed.\n"), McbSERVICENAME);
+    }
+
+   /*
+    *************************************************************************
+    * Make sure it is running now, so this session can use it immediately.
+    *************************************************************************
+    */
+    SERVICE_STATUS ss = { 0 };
+    if (::QueryServiceStatus(hService, &ss) &&
+        ss.dwCurrentState == SERVICE_RUNNING)
+    {
+        ::_tprintf(_T("Service already running.\n"));
+    }
+    else if (::StartService(hService, 0, NULL))
+    {
+        ::_tprintf(_T("Service started.\n"));
+    }
+    else
+    {
+        DWORD dwStart = ::GetLastError();
+        if (dwStart == ERROR_SERVICE_ALREADY_RUNNING)
+        {
+            ::_tprintf(_T("Service already running.\n"));
+        }
+        else
+        {
+            dwErr = dwStart;
+            ::_tprintf(_T("StartService failed: %d\n"), dwStart);
+        }
+    }
+
+    ::CloseServiceHandle(hService);
+    ::CloseServiceHandle(hSCM);
+    return dwErr;
+}
+
+/**
+ ****************************************************************************
+ * <P> Stop and remove the persistent McbCmdAsUser service.  Requires
+ * admin.  </P>
+ *
+ * @methodName  McbUninstallService
+ *
+ * @return      int    (a Win32 error code, ERROR_SUCCESS on success)
+ *
+ * @author      Martyn C Brown
+ ****************************************************************************
+ */
+int McbUninstallService()
+{
+    SC_HANDLE hSCM = ::OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!hSCM)
+    {
+        DWORD dwErr = ::GetLastError();
+        ::_tprintf(_T("OpenSCManager failed: %d (run elevated).\n"), dwErr);
+        return dwErr;
+    }
+
+    DWORD dwErr = ERROR_SUCCESS;
+
+    SC_HANDLE hService = ::OpenService(hSCM, McbSERVICENAME,
+        SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
+    if (!hService)
+    {
+        dwErr = ::GetLastError();
+        if (dwErr == ERROR_SERVICE_DOES_NOT_EXIST)
+        {
+            ::_tprintf(_T("Service '%s' is not installed.\n"), McbSERVICENAME);
+            dwErr = ERROR_SUCCESS;
+        }
+        else
+        {
+            ::_tprintf(_T("OpenService failed: %d\n"), dwErr);
+        }
+        ::CloseServiceHandle(hSCM);
+        return dwErr;
+    }
+
+    SERVICE_STATUS ss = { 0 };
+    if (::QueryServiceStatus(hService, &ss) &&
+        ss.dwCurrentState != SERVICE_STOPPED)
+    {
+        if (::ControlService(hService, SERVICE_CONTROL_STOP, &ss))
+        {
+            while (::QueryServiceStatus(hService, &ss) &&
+                ss.dwCurrentState != SERVICE_STOPPED)
+            {
+                ::Sleep(300);
+            }
+        }
+    }
+
+    if (::DeleteService(hService))
+    {
+        ::_tprintf(_T("Service '%s' removed.\n"), McbSERVICENAME);
+    }
+    else
+    {
+        dwErr = ::GetLastError();
+        ::_tprintf(_T("DeleteService failed: %d\n"), dwErr);
+    }
+
+    ::CloseServiceHandle(hService);
+    ::CloseServiceHandle(hSCM);
+    return dwErr;
+}
+
+/**
+ ****************************************************************************
  * <P> Initiate a request.  </P>
  *
  * @methodName  McbInvokeService
@@ -1052,11 +1430,20 @@ void McbInvokeService(McbParams &params, McbResults &results)
             * First attempt to open the service
             *****************************************************************
             */
-            SC_HANDLE hService = ::OpenService(hSCM, McbSERVICENAME, 
+            SC_HANDLE hService = ::OpenService(hSCM, McbSERVICENAME,
                 dwAccess);
 
+           /*
+            *****************************************************************
+            * Track whether WE created the service here.  If the persistent
+            * McbCmdAsUser service (installed via /install) already exists we
+            * adopt it - and we must NOT tear it down afterwards.
+            *****************************************************************
+            */
+            bool bCreatedService = false;
+
             if (!hService)
-            {                    
+            {
                /*
                 *************************************************************
                 * If we failed to open the service then attempt to create it
@@ -1064,10 +1451,15 @@ void McbInvokeService(McbParams &params, McbResults &results)
                 */
               DWORD dwFlags = SERVICE_WIN32_OWN_PROCESS |
                 SERVICE_INTERACTIVE_PROCESS;
-                hService = ::CreateService(hSCM, McbSERVICENAME, NULL, 
-                    dwAccess, dwFlags, SERVICE_DEMAND_START, 
-                    SERVICE_ERROR_NORMAL, szTempFile, NULL, NULL, NULL, 
+                hService = ::CreateService(hSCM, McbSERVICENAME, NULL,
+                    dwAccess, dwFlags, SERVICE_DEMAND_START,
+                    SERVICE_ERROR_NORMAL, szTempFile, NULL, NULL, NULL,
                     NULL, NULL);
+
+                if (hService)
+                {
+                    bCreatedService = true;
+                }
             }
 
            /*
@@ -1111,113 +1503,62 @@ void McbInvokeService(McbParams &params, McbResults &results)
                 */
                 if (bServiceRunning)
                 {
-                    McbSmartSharedMem mem(McbMAXMEM, McbSHAREDMEM, &g_sa);
-
-                    {
-                       /*
-                        *****************************************************
-                        * Enter the shared memory lock
-                        *****************************************************
-                        */
-                        McbAutoMutex automutex(g_mutData);
-                                       
-                       /*
-                        *****************************************************
-                        * Marshal the parameters into the shared memory.
-                        *****************************************************
-                        */
-                        params.McbMarshal((LPBYTE)mem);                
-                    }
-
-                    McbTRACE((McbTRACESHAREDMEM, 
-                        _T("MARSHALLED - User: %s\nDomain: %s\nPassword:")
-                        _T(" %s\nCommand Line: %s\n"), 
-                        McbSTREMPTY(params.m_strUser), 
-                        McbSTREMPTY(params.m_strDomain),  
-                        McbSTREMPTY(params.m_strPwd),                     
-                        McbSTREMPTY(params.m_strCmdLine)))
+                   /*
+                    *********************************************************
+                    * Hand the request to the service and wait for it over
+                    * the shared-memory IPC (same handshake a non-elevated
+                    * caller uses against the persistent service).
+                    *********************************************************
+                    */
+                    McbExecuteViaRunningService(params, results);
 
                    /*
                     *********************************************************
-                    * Set the event to tell the service to do something
+                    * Only tear down a service we CREATED here (the transient
+                    * fallback).  If we adopted the persistent McbCmdAsUser
+                    * service, leave it installed and running.
                     *********************************************************
                     */
-                    ::SetEvent(g_evtData);
-
-                   /*
-                    *********************************************************
-                    * Now wait for the service to complete the task
-                    *********************************************************
-                    */
-                    McbTRACE((McbTRACECOMPLETE, 
-                        _T("Waiting for completion\n")))
-
-                    McbSmartEvent evtComplete(McbCOMPLETEDEVENT, true, 
-                      false, &g_sa);
-
-                    ::WaitForSingleObject(evtComplete, INFINITE);
-
-                    McbTRACE((McbTRACECOMPLETE, _T("Event completed\n")))
-
+                    if (bCreatedService)
                     {
-                       /*
-                        *****************************************************
-                        * Enter the shared memory lock
-                        *****************************************************
-                        */
-                        McbAutoMutex automutex(g_mutData);
-                                       
-                       /*
-                        *****************************************************
-                        * unmarshal the results created by the service.
-                        *****************************************************
-                        */
-                        results.McbUnMarshal((LPBYTE)mem);                
-                    }
-
-                   /*
-                    *********************************************************
-                    * Ask the service to stop
-                    *********************************************************
-                    */
-                    SERVICE_STATUS status;
-                    if (::ControlService(hService, SERVICE_CONTROL_STOP, 
-                        &status))
-                    {
-                       /*
-                        *****************************************************
-                        * Query the service until it stops
-                        *****************************************************
-                        */
-                        while(::QueryServiceStatus(hService, &status) && 
-                            status.dwCurrentState != SERVICE_STOPPED)
+                        SERVICE_STATUS status;
+                        if (::ControlService(hService, SERVICE_CONTROL_STOP,
+                            &status))
                         {
                            /*
                             *************************************************
-                            * Yield for a while
+                            * Query the service until it stops
                             *************************************************
                             */
-                            ::Sleep(300);
-                        }
+                            while(::QueryServiceStatus(hService, &status) &&
+                                status.dwCurrentState != SERVICE_STOPPED)
+                            {
+                                ::Sleep(300);
+                            }
 
-                        McbTRACE((McbTRACECOMPLETE, _T("Service ended\n")))
-                    }                
+                            McbTRACE((McbTRACECOMPLETE, _T("Service ended\n")))
+                        }
+                    }
                 }
 
                /*
                 *************************************************************
-                * Attempt to delete the service
+                * Delete ONLY a service we created; never delete an adopted
+                * persistent service.
                 *************************************************************
                 */
-                if (::DeleteService(hService))
+                if (bCreatedService)
                 {
-                   /*
-                    *********************************************************
-                    * Attempt to delete the file
-                    *********************************************************
-                    */
-                    ::DeleteFile(szTempFile);                    
+                    ::DeleteService(hService);
                 }
+
+               /*
+                *************************************************************
+                * The temp copy is only used by a transient service, but
+                * delete it regardless so we never leave an orphan behind.
+                *************************************************************
+                */
+                ::DeleteFile(szTempFile);
 
                /*
                 *************************************************************
@@ -1352,6 +1693,8 @@ void McbUsage()
     ::_tprintf(_T("CmdAsUser - start a command as a specified user.\n"));
     ::_tprintf(_T("\n"));
     ::_tprintf(_T("Usage: CmdAsUser <user> <domain> [/p <password>] [/c <command>]\n"));
+    ::_tprintf(_T("       CmdAsUser /install\n"));
+    ::_tprintf(_T("       CmdAsUser /uninstall\n"));
     ::_tprintf(_T("\n"));
     ::_tprintf(_T("Where:\n"));
     ::_tprintf(_T("   <user>        is the name of the user.\n"));
@@ -1359,20 +1702,30 @@ void McbUsage()
     ::_tprintf(_T("   <password>    (optional) is the users password.\n"));
     ::_tprintf(_T("   <command>     (optional) is the command line to execute as the specified\n"));
     ::_tprintf(_T("                 user.\n"));
+    ::_tprintf(_T("   /install      (admin) deploy the binaries into System32/SysWOW64 and\n"));
+    ::_tprintf(_T("                 register the persistent McbCmdAsUser service - an auto-start\n"));
+    ::_tprintf(_T("                 LocalSystem service - then start it.\n"));
+    ::_tprintf(_T("   /uninstall    (admin) stop and remove that service.\n"));
     ::_tprintf(_T("\n"));
     ::_tprintf(_T("Notes:\n"));
     ::_tprintf(_T("   If the password is not given then you will be prompted for it.\n"));
     ::_tprintf(_T("   If the command is not given then \"CommandServer.exe\" is assumed.\n"));
-    ::_tprintf(_T("   The calling process needs to either have administrative privileges (ie in\n"));
-    ::_tprintf(_T("   the local adminstrators group) or at LEAST the following privileges:\n"));        
-    ::_tprintf(_T("      \"Act as part of the operating system\" (SeTcbPrivilege),\n"));    
+    ::_tprintf(_T("   When the System account is requested and the persistent service (installed\n"));
+    ::_tprintf(_T("   with /install) is running, the request is handed to it over a shared-memory\n"));
+    ::_tprintf(_T("   IPC - this needs NO administrative rights, so it works from a normal logon.\n"));
+    ::_tprintf(_T("   If that service is not running, CmdAsUser falls back to spinning up a\n"));
+    ::_tprintf(_T("   transient service, which DOES require the calling process to either have\n"));
+    ::_tprintf(_T("   administrative privileges (ie in the local adminstrators group) or at LEAST\n"));
+    ::_tprintf(_T("   the following privileges:\n"));
+    ::_tprintf(_T("      \"Act as part of the operating system\" (SeTcbPrivilege),\n"));
     ::_tprintf(_T("      \"Bypass traverse checking\" (SeChangeNotifyPrivilege),\n"));
     ::_tprintf(_T("      \"Increase quotas\" (SeIncreaseQuotaPrivilege),\n"));
-    ::_tprintf(_T("      \"Replace a process level token\" (SeAssignPrimaryTokenPrivilege).\n"));     
+    ::_tprintf(_T("      \"Replace a process level token\" (SeAssignPrimaryTokenPrivilege).\n"));
     ::_tprintf(_T("   The utility may take a while if there is inappropriate security so please\n"));
     ::_tprintf(_T("   be patient.\n"));
     ::_tprintf(_T("\n"));
     ::_tprintf(_T("Examples:\n"));
+    ::_tprintf(_T("   CmdAsUser /install\n"));
     ::_tprintf(_T("   CmdAsUser Martyn . /p GingerNinja /c regedit\n"));
     ::_tprintf(_T("   CmdAsUser System . /c CommandServer.exe\n"));
     ::_tprintf(_T("   CmdAsUser System .\n"));
@@ -1534,54 +1887,159 @@ bool McbParseParams(int argc, LPCTSTR argv[], McbParams &params)
 
 bool CopyFileToDestination(LPCTSTR fileName, LPCTSTR destinationPath)
 {
-    TCHAR currentDir[MAX_PATH];
     TCHAR sourceFile[MAX_PATH];
     TCHAR destinationFile[MAX_PATH];
 
-    // Get the current directory
-    if (!GetCurrentDirectory(MAX_PATH, currentDir))
+    // Look next to THIS executable first, so /install works regardless of the
+    // current directory. GetModuleFileName gives the full path to CmdAsUser.exe;
+    // strip the file name to get its folder.
+    TCHAR moduleDir[MAX_PATH];
+    sourceFile[0] = _T('\0');
+    if (GetModuleFileName(NULL, moduleDir, MAX_PATH))
     {
-        std::cerr << "Failed to get current directory. Error: " << GetLastError() << std::endl;
-        return false;
+        LPTSTR lastSlash = _tcsrchr(moduleDir, _T('\\'));
+        if (lastSlash)
+        {
+            *lastSlash = _T('\0');
+            _stprintf_s(sourceFile, _T("%s\\%s"), moduleDir, fileName);
+        }
     }
 
-    // Construct the full path of the source file
-    _stprintf_s(sourceFile, _T("%s\\%s"), currentDir, fileName);
+    // If it is not alongside the exe, fall back to just the file name; the OS
+    // resolves that against the current directory / search path.
+    if (sourceFile[0] == _T('\0') ||
+        GetFileAttributes(sourceFile) == INVALID_FILE_ATTRIBUTES)
+    {
+        _tcscpy_s(sourceFile, fileName);
+    }
 
     // Construct the full path of the destination file
     _stprintf_s(destinationFile, _T("%s\\%s"), destinationPath, fileName);
 
-    // Check if the file exists in the current directory
+    // Check that we actually found a source file
     if (GetFileAttributes(sourceFile) == INVALID_FILE_ATTRIBUTES)
     {
         std::cerr << "File does not exist: " << sourceFile << std::endl;
         return false;
     }
 
+    // Nothing to do if the source already IS the destination (e.g. the
+    // deployed System32 copy being asked to install itself) - CopyFile would
+    // otherwise fail with a sharing violation.
+    if (_tcsicmp(sourceFile, destinationFile) == 0)
+    {
+        std::cout << "Already in place: " << destinationFile << std::endl;
+        return true;
+    }
+
     // Copy the file to the destination directory
     if (!CopyFile(sourceFile, destinationFile, FALSE))
     {
-        std::cerr << "Failed to copy file. Error: " << GetLastError() << std::endl;
+        std::cerr << "Failed to copy " << sourceFile << " -> " << destinationFile
+            << ". Error: " << GetLastError() << std::endl;
         return false;
     }
 
-    std::cout << "File copied successfully to " << destinationFile << std::endl;
+    std::cout << "Copied " << sourceFile << " -> " << destinationFile << std::endl;
     return true;
 }
 
 bool CopyFileToSysWOW64(LPCTSTR fileName)
 {
-    return CopyFileToDestination(fileName, _T("C:\\Windows\\SysWOW64"));
+    // Resolve the real SysWOW64 path rather than hardcoding C:\Windows.
+    // Returns 0 on a system with no WOW64 subsystem - nothing to deploy there.
+    TCHAR wow64Dir[MAX_PATH];
+    if (GetSystemWow64Directory(wow64Dir, MAX_PATH) == 0)
+    {
+        return true;
+    }
+    return CopyFileToDestination(fileName, wow64Dir);
 }
 
 bool CopyFileToSystem32(LPCTSTR fileName)
 {
-    return CopyFileToDestination(fileName, _T("C:\\Windows\\System32"));
+    // Resolve the real System32 path rather than hardcoding C:\Windows.
+    TCHAR sysDir[MAX_PATH];
+    if (GetSystemDirectory(sysDir, MAX_PATH) == 0)
+    {
+        std::cerr << "Failed to resolve the System32 directory. Error: "
+            << GetLastError() << std::endl;
+        return false;
+    }
+    return CopyFileToDestination(fileName, sysDir);
 }
 
 /**
  ****************************************************************************
- * <P> Entry point.  We will first be called from the command line, in which 
+ * <P> Return true if the current process is running with an elevated
+ * (administrator) token.  Used to decide whether to attempt the self-copy
+ * into System32/SysWOW64: a non-elevated caller (e.g. the logon launcher)
+ * cannot write there, so it skips the copy silently instead of printing a
+ * row of "Failed to copy file. Error: 5" access-denied messages.  </P>
+ *
+ * @methodName  McbIsProcessElevated
+ *
+ * @return      bool
+ *
+ * @author      Martyn C Brown
+ ****************************************************************************
+ */
+bool McbIsProcessElevated()
+{
+    bool bElevated = false;
+
+    HANDLE hToken = NULL;
+    if (::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &hToken))
+    {
+        TOKEN_ELEVATION elevation = { 0 };
+        DWORD cbSize = sizeof(elevation);
+        if (::GetTokenInformation(hToken, TokenElevation, &elevation,
+            sizeof(elevation), &cbSize))
+        {
+            bElevated = (elevation.TokenIsElevated != 0);
+        }
+        ::CloseHandle(hToken);
+    }
+
+    return bElevated;
+}
+
+/**
+ ****************************************************************************
+ * <P> Deploy the three binaries into System32 and SysWOW64.  This is the
+ * install-time self-copy; it only makes sense when running elevated.
+ *
+ * Returns true only if all three System32 copies succeeded - those are the
+ * ones on the PATH (and the service runs System32\CmdAsUser.exe), so a
+ * failure there must fail /install.  The SysWOW64 copies are best-effort
+ * (this project is x64-only) and never fail the deploy.  </P>
+ *
+ * @methodName  McbDeployBinaries
+ *
+ * @return      bool
+ *
+ * @author      Martyn C Brown
+ ****************************************************************************
+ */
+bool McbDeployBinaries()
+{
+    bool bOk = true;
+
+    bOk = CopyFileToSystem32(_T("CmdAsUser.exe"))      && bOk;
+    bOk = CopyFileToSystem32(_T("CommandClient.exe"))  && bOk;
+    bOk = CopyFileToSystem32(_T("CommandServer.exe"))  && bOk;
+
+    CopyFileToSysWOW64(_T("CmdAsUser.exe"));
+    CopyFileToSysWOW64(_T("CommandClient.exe"));
+    CopyFileToSysWOW64(_T("CommandServer.exe"));
+
+    std::cout << std::endl;
+    return bOk;
+}
+
+/**
+ ****************************************************************************
+ * <P> Entry point.  We will first be called from the command line, in which
  * case we will install ourself as a service and start the service up.  This 
  * entry point therefore needs to be able to be called by the service control
  * manager to start the service AND from the command line.  We are going to 
@@ -1637,16 +2095,67 @@ int _tmain(int argc, LPCTSTR argv[])
     * If we are being called from the command line....
     *************************************************************************
     */
-    else 
+    else
     {
-        CopyFileToSystem32(_T("CmdAsUser.exe"));
-        CopyFileToSystem32(_T("CommandClient.exe"));
-        CopyFileToSystem32(_T("CommandServer.exe"));
+       /*
+        *********************************************************************
+        * Service management verbs.  "/install" deploys the binaries and
+        * registers the persistent auto-start SYSTEM service; "/uninstall"
+        * removes it.  Both need administrator rights (they write to the
+        * SCM) and are intended to be run from the elevated installer.
+        *********************************************************************
+        */
+        if (argc >= 2 && ::_tcsicmp(argv[1], _T("/install")) == 0)
+        {
+            if (!McbIsProcessElevated())
+            {
+                ::_tprintf(_T("/install requires administrator rights.\n"));
+                return ERROR_ACCESS_DENIED;
+            }
 
-        CopyFileToSysWOW64(_T("CmdAsUser.exe"));
-        CopyFileToSysWOW64(_T("CommandClient.exe"));
-        CopyFileToSysWOW64(_T("CommandServer.exe"));
-		std::cout << std::endl;
+           /*
+            * Release every binary we are about to overwrite: stop the
+            * service (unlocks System32\CmdAsUser.exe) and terminate any
+            * running CommandServer / CommandClient (they lock their own
+            * System32 copies).  Then deploy the fresh binaries onto the
+            * PATH and (re)create and start the service.
+            */
+            McbStopServiceIfRunning();
+            McbTerminateProcessByName(_T("CommandServer.exe"));
+            McbTerminateProcessByName(_T("CommandClient.exe"));
+
+            if (!McbDeployBinaries())
+            {
+                ::_tprintf(_T("Binary deployment failed; aborting install ")
+                    _T("(the service was NOT changed).\n"));
+                return ERROR_INSTALL_FAILURE;
+            }
+
+            return McbInstallService();
+        }
+
+        if (argc >= 2 && ::_tcsicmp(argv[1], _T("/uninstall")) == 0)
+        {
+            if (!McbIsProcessElevated())
+            {
+                ::_tprintf(_T("/uninstall requires administrator rights.\n"));
+                return ERROR_ACCESS_DENIED;
+            }
+
+            return McbUninstallService();
+        }
+
+       /*
+        *********************************************************************
+        * The self-copy into System32/SysWOW64 is an install-time action and
+        * only works elevated.  Skip it silently otherwise so a non-elevated
+        * caller (the logon launcher) does not spew access-denied errors.
+        *********************************************************************
+        */
+        if (McbIsProcessElevated())
+        {
+            McbDeployBinaries();
+        }
 
        /*
         *********************************************************************
@@ -1711,13 +2220,25 @@ int _tmain(int argc, LPCTSTR argv[])
                                 
                /*
                 *************************************************************
-                * Process the request by invoking the service
+                * Process the request.  If the persistent service is already
+                * running, talk to it directly over the shared-memory IPC -
+                * this needs NO admin rights, so the non-elevated logon
+                * launcher works.  Otherwise fall back to the original
+                * behaviour (spin up a transient service), which does need
+                * admin.
                 *************************************************************
                 */
                 results.m_dwError = 0;
                 results.m_strError.erase();
 
-                McbInvokeService(params, results);                                
+                if (McbIsServiceRunning())
+                {
+                    McbExecuteViaRunningService(params, results);
+                }
+                else
+                {
+                    McbInvokeService(params, results);
+                }
             }
 
            /*
