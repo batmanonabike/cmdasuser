@@ -102,6 +102,36 @@ foreach ($f in 'startup.ps1','logon-task.cmd') {
     catch { Fail "Failed to copy $f -> $dst : $($_.Exception.Message)" }
 }
 
+# --- Step 2b: copy the logon launcher into the current user's Startup folder --
+# This launcher runs in the USER context at each logon (the Startup folder
+# cannot elevate). It is placed in the current user's Startup folder so it runs
+# at that user's logon.
+#
+# NOTE: this installer runs elevated, so $env:APPDATA resolves to the ADMIN
+# profile that approved the elevation, which may differ from the interactive
+# user. Prefer the Shell "Startup" special folder, falling back to APPDATA.
+Write-Host "Step 2b: copying logon launcher to the current user's Startup folder..."
+try {
+    $startupFolder = (New-Object -ComObject WScript.Shell).SpecialFolders('Startup')
+} catch { $startupFolder = $null }
+if (-not $startupFolder) {
+    $startupFolder = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
+}
+$launcher      = 'logon-startup-launcher.cmd'
+$launcherSrc   = Join-Path $scriptDir $launcher
+$launcherDst   = Join-Path $startupFolder $launcher
+if (-not (Test-Path $launcherSrc)) {
+    Fail "Source launcher missing: $launcherSrc"
+} else {
+    try {
+        New-Item -ItemType Directory -Path $startupFolder -Force | Out-Null
+        Copy-Item $launcherSrc $launcherDst -Force
+        Write-Host "  [ok]   $launcherDst"
+    } catch {
+        Fail "Failed to copy $launcher -> $launcherDst : $($_.Exception.Message)"
+    }
+}
+
 # --- Step 3: set machine environment variables via setx ----------------------
 Write-Host 'Step 3: setting machine environment variables (setx /M)...'
 $vars = [ordered]@{
