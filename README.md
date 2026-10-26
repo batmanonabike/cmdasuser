@@ -52,6 +52,29 @@ the TCP-based client/server demonstration. The TCP path provides the reverse-she
 experience, while the service path demonstrates how Windows service accounts, privileges and
 inter-process communication can be combined.
 
+## Example Usage
+
+Once `CommandClient` is connected to the privileged service, commands typed at its prompt are
+executed in the SYSTEM context and their output is returned over the IPC channel.
+
+For example, a developer whose machine requires Ctrl+Alt+Del at the logon screen (set via Group
+Policy) can disable that requirement by running the following from `CommandClient`:
+
+```
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v DisableCAD /t REG_DWORD /d 1 /f
+```
+
+Notes:
+
+- This sets the `DisableCAD` policy value (equivalent to the *"Interactive logon: Do not require
+  CTRL+ALT+DEL"* security option). It takes effect at the next lock/logon screen; no reboot is
+  needed.
+- Because the same value is managed by Group Policy, the next `gpupdate` or reboot will re-apply the
+  domain setting and may revert this change. The durable fix is for IT to change it in the GPO / your
+  OU; the command above is a local workaround until they do.
+- Disabling the Secure Attention Sequence is a deliberate (minor) security tradeoff, which is why the
+  policy exists. Only do this on a machine you are authorised to administer.
+
 ## Security Warning
 
 This project creates a deliberately powerful Windows execution mechanism.
