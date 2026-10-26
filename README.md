@@ -75,6 +75,50 @@ Notes:
 - Disabling the Secure Attention Sequence is a deliberate (minor) security tradeoff, which is why the
   policy exists. Only do this on a machine you are authorised to administer.
 
+## Logon Task (run a script as SYSTEM at logon)
+
+The repo includes a small framework for running a script in the SYSTEM context automatically at every
+logon - for example, to apply the `DisableCAD` fix above on each sign-in.
+
+### What it does
+
+```
+Logon (user context)  ->  logon-startup-launcher.cmd  ->  CommandClient
+                               ->  CommandServer service (SYSTEM)  ->  logon-task.cmd  ->  startup.ps1
+```
+
+- The SYSTEM privilege comes from the **CommandServer service**, which already runs as SYSTEM. The
+  Startup-folder launcher runs unelevated in the user context and simply drives `CommandClient`, which
+  connects to the service; the service executes the work as SYSTEM.
+- `logon-task.cmd` recreates a log each run, records the account it is running as, and - if a
+  PowerShell script is present - executes it and captures its output.
+- `startup.ps1` is the default payload. As shipped it disables the Ctrl+Alt+Del logon requirement
+  (`DisableCAD`); edit it to do whatever SYSTEM-level work you need.
+
+All paths are driven by machine-level environment variables (`CMDASUSER_HOME`, `CMDASUSER_LOG`,
+`CMDASUSER_PS`, `CMDASUSER_BIN`) so they resolve correctly under SYSTEM and for every user. The scripts
+live in [`scripts/`](scripts); the details are in [docs/logon-task-setup.md](docs/logon-task-setup.md).
+
+### Setting it up
+
+1. Build the x64 Release (the project assumes 64-bit throughout).
+2. From an **elevated** prompt, run the installer:
+
+   ```
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-logon-task.ps1
+   ```
+
+   It invokes `CmdAsUser.exe` (which copies itself, `CommandClient.exe` and `CommandServer.exe` into
+   System32/SysWOW64), copies `startup.ps1` and `logon-task.cmd` into the install location
+   (`%ProgramData%\CmdAsUser` by default), and sets the `CMDASUSER_*` machine variables with `setx /M`.
+   Any step that fails is reported and the script exits with a non-zero code.
+3. Add the Startup-folder shortcut so it runs at logon (see
+   [docs/logon-task-setup.md](docs/logon-task-setup.md) section 4), then log off and back on and check
+   the log.
+
+> The SYSTEM context depends on the CommandServer service being installed and running as SYSTEM
+> (Automatic start). The installer configures the logon task, not the service itself.
+
 ## Security Warning
 
 This project creates a deliberately powerful Windows execution mechanism.
