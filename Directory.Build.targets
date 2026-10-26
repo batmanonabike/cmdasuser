@@ -1,0 +1,11 @@
+<Project>
+  <!-- Pull in vcpkg (manifest mode, see vcpkg.json) without needing "vcpkg integrate install".
+       Uses VCPKG_ROOT if set, otherwise the copy bundled with Visual Studio. -->
+  <PropertyGroup>
+    <_CmdAsUserVcpkgRoot Condition="'$(VCPKG_ROOT)' != ''">$(VCPKG_ROOT)</_CmdAsUserVcpkgRoot>
+    <_CmdAsUserVcpkgRoot Condition="'$(_CmdAsUserVcpkgRoot)' == ''">$(VsInstallRoot)\VC\vcpkg</_CmdAsUserVcpkgRoot>
+    <_CmdAsUserVcpkgTargets>$(_CmdAsUserVcpkgRoot)\scripts\buildsystems\msbuild\vcpkg.targets</_CmdAsUserVcpkgTargets>
+  </PropertyGroup>
+  <Import Project="$(_CmdAsUserVcpkgTargets)"
+          Condition="'$(VcpkgPropsImported)' != 'true' and Exists('$(_CmdAsUserVcpkgTargets)')" />
+</Project>
