@@ -4,6 +4,10 @@ Status: **open / unresolved**. This file records the problems seen after reworki
 into a persistent-service model, plus the diagnostic information gathered, so they can be
 investigated later. It deliberately does **not** attempt fixes.
 
+NOTING:
+This might have just been an issue with a required REBOOT.
+Needs retesting later.
+
 Captured: 2026-10-26.
 
 ## Context — what changed
